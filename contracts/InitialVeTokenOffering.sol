@@ -1,132 +1,163 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 interface IVeToken {
-	function lock(address _receiver, uint256 _amount, uint256 _period) external;
+    function delegateLock(address _receiver, uint256 _amount, uint256 _period) external;
 }
 
 interface IERC20Mintable {
-	function mint(address _receiver, uint256 _amount) external;
+    function mint(address _receiver, uint256 _amount) external;
 }
 
 contract InitialVeTokenOffering is Ownable {
-	// Mainnet WETH address
-	address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-	address public baseToken;
-	address public veToken;
+    address public immutable baseToken;
+    address public immutable veToken;
+    struct TokenType {
+        bool isVeToken;
+        uint256 lockedPeriod;
+    }
+    // 1 => Base Token, no lock
+    // 2 => VeToken locked for 3 months
+    mapping(uint256 saleId => TokenType tokenType) public tokenTypes;
 
-	uint256 public endTimestamp;
+    uint256 public constant INIT_STATUS = 0;
+    uint256 public constant PENDING_START = 1;
+    uint256 public constant LIVE = 2;
+    uint256 public constant CLAIMABLE = 3;
 
-	// Token address => Chainlink price feed address, address(0) means unsupported
-	// ETH & WETH are supported by default
-	mapping(address => address) supportedToken;
+    struct Sale {
+        uint256 price;
+        uint256 totalAmount;
+        uint256 soldAmount;
+        uint256 deadline;
+        uint256 status;
+    }
+    mapping(uint256 saleId => Sale sale) public sales;
 
-	struct FundingInfo {
-		// Funded value in USD, scaled by 1e8
-		uint256 fundValue;
-		uint256 option;
-	}
-	mapping(address => FundingInfo) public record;
+    // User address => Sale ID => User bought amount
+    mapping(address user => mapping(uint256 saleId => uint256 amount)) public userBought;
 
-	// Option => ICO price
-	mapping(uint256 => uint256) public options;
+    uint256 public currentSaleId;
 
-	constructor(address _baseToken, address _veToken, uint256 _durationInDays) {
-		baseToken = _baseToken;
-		veToken = _veToken;
-		endTimestamp = block.timestamp + _durationInDays * 24 * 3600;
-		// Chainlink mainnet ETH/USD price feed
-		supportedToken[WETH] = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
-		// ICO prices for different options, scaled by 1e8
-		options[1] = 5e7; // 0.5 USD
-		options[2] = 4e7; // 0.4 USD
-		options[3] = 2e7; // 0.2 USD
-	}
+    event IVOTokenClaimed(address indexed user, uint256 indexed saleId, uint256 _amount);
+    event NewSaleAdded(
+        uint256 indexed saleId,
+        bool _isVeToken,
+        uint256 _lockedPeriod,
+        uint256 _price,
+        uint256 _totalAmount,
+        uint256 _deadline
+    );
+    event SaleStarted(uint256 indexed saleId);
+    event SaleSettled(uint256 saleId);
+    event IVOTokenBought(address user, uint256 saleId, uint256 amount);
 
-	function supportToken(address _token, address _feedAddress) external onlyOwner {
-		supportedToken[_token] = _feedAddress;
-	}
+    constructor(address _baseToken, address _veToken) {
+        baseToken = _baseToken;
+        veToken = _veToken;
+    }
 
-	function setOption(uint256 _option, uint256 _price) external onlyOwner {
-		require(_option > 0, "Option cannot be 0");
+    modifier notContract() {
+        // solhint-disable-next-line avoid-tx-origin
+        require(msg.sender == tx.origin, "Contracts are not allowed");
+        _;
+    }
 
-		options[_option] = _price;
-	}
+    function getUserBoughtAmount(address _user, uint256 _saleId) public view returns (uint256) {
+        return userBought[_user][_saleId];
+    }
 
-	function fund(address _token, uint256 _amount, uint256 _option) external {
-		require(block.timestamp < endTimestamp, "IVO already ended");
-		require(supportedToken[_token] != address(0), "Token not supported");
+    function addNewSale(
+        bool _isVeToken,
+        uint256 _lockedPeriod,
+        uint256 _price,
+        uint256 _totalAmount,
+        uint256 _deadline
+    ) public {
+        require(block.timestamp < _deadline, "Endtime already passed");
+        require(_totalAmount > 0, "Total amount cannot be 0");
+        if (_isVeToken) require(_lockedPeriod > 0, "Lock period cannot be 0");
 
-		IERC20(_token).transferFrom(msg.sender, address(this), _amount);
+        uint256 currentId = ++currentSaleId;
 
-		FundingInfo storage info = record[msg.sender];
-		record[msg.sender].fundValue += _getValue(_token, _amount);
-		// Never funded before
-		if (info.option == 0) {
-			changeOption(_option);
-		} 
-		// Funded before, add funds, _option == 0 means option unchanged
-		else {
-			if (_option != 0) changeOption(_option);
-		}
-	}
+        TokenType storage tokenType = tokenTypes[currentId];
+        tokenType.isVeToken = _isVeToken;
+        tokenType.lockedPeriod = _lockedPeriod;
 
-	function fundWithETH(uint256 _option) payable external {
-		require(block.timestamp < endTimestamp, "IVO already ended");
+        Sale storage sale = sales[currentId];
+        sale.price = _price;
+        sale.totalAmount = _totalAmount;
+        sale.deadline = _deadline;
 
-		FundingInfo storage info = record[msg.sender];
-		record[msg.sender].fundValue += _getValue(WETH, msg.value);
-		// Never funded before
-		if (info.option == 0) {
-			changeOption(_option);
-		} 
-		// Funded before, add funds, _option == 0 means option unchanged
-		else {
-			if (_option != 0) changeOption(_option);
-		}
-	}
+        sale.status = PENDING_START;
 
-	function changeOption(uint256 _newOption) public {
-		require(record[msg.sender].fundValue > 0, "You did not fund anything");
-		require(_newOption > 0 && _newOption < 4, "Invalid option"); 
-		record[msg.sender].option = _newOption;
-	}
+        emit NewSaleAdded(currentId, _isVeToken, _lockedPeriod, _price, _totalAmount, _deadline);
+    }
 
-	function claim() external {
-		require(block.timestamp > endTimestamp, "IVO not yet ended");
+    function startSale(uint256 _saleId) external onlyOwner {
+        Sale storage sale = sales[_saleId];
 
-		FundingInfo memory info = record[msg.sender];
-		require(info.fundValue > 0, "You did not participate");
+        require(sale.status == PENDING_START, "Sale already started");
 
-		uint256 mintAmount = info.fundValue * 1e18 / options[info.option];
-		if (info.option == 1) IERC20Mintable(baseToken).mint(msg.sender, mintAmount);
-		else IERC20Mintable(baseToken).mint(address(this), mintAmount);
+        sale.status = LIVE;
 
-		// Lock into veToken for 3 months 
-		if (info.option == 2) IVeToken(veToken).lock(msg.sender, mintAmount, 90 days);
-		// Lock into veToken for 1 year
-		else IVeToken(veToken).lock(msg.sender, mintAmount, 365 days);
+        emit SaleStarted(_saleId);
+    }
 
-		delete record[msg.sender];
-	}
+    function buy(uint256 _saleId, uint256 _amount) external payable notContract {
+        Sale storage sale = sales[_saleId];
 
-	// Get USD value of fund amount, scaled by 1e8
-	function _getValue(address _token, uint256 _amount) internal view returns (uint256 value) {
-		(
-            /* uint80 roundID */,
-            int256 price,
-            /*uint startedAt*/,
-            /*uint timeStamp*/,
-            /*uint80 answeredInRound*/
-        ) = AggregatorV3Interface(supportedToken[_token]).latestRoundData();
-        uint256 formatPrice = price < 0 ? 0 : uint256(price);
+        require(block.timestamp < sale.deadline, "Sale already ended");
+        require(sale.soldAmount + _amount <= sale.totalAmount, "Not enough tokens left");
+        require((sale.price * _amount) / 1e18 <= msg.value, "Invalid amount");
 
-		value = formatPrice * _amount / IERC20Metadata(_token).decimals();
-	}
+        sale.soldAmount += _amount;
+
+        userBought[msg.sender][_saleId] += _amount;
+
+        uint256 extraFund = msg.value - (sale.price * _amount) / 1e18;
+        _refund(msg.sender, extraFund);
+
+        emit IVOTokenBought(msg.sender, _saleId, _amount);
+    }
+
+    function settle(uint256 _saleId) external onlyOwner {
+        Sale storage sale = sales[_saleId];
+
+        require(block.timestamp >= sale.deadline, "Sale not ended yet");
+
+        sale.status = CLAIMABLE;
+
+        emit SaleSettled(_saleId);
+    }
+
+    function claim(uint256 _saleId) external {
+        Sale storage sale = sales[_saleId];
+
+        require(sale.status == CLAIMABLE, "Sale not claimable");
+
+        uint256 amount = userBought[msg.sender][_saleId];
+
+        require(amount > 0, "No tokens to claim");
+
+        if (tokenTypes[_saleId].isVeToken) {
+            IERC20Mintable(baseToken).mint(address(this), amount);
+            IVeToken(veToken).delegateLock(msg.sender, amount, tokenTypes[_saleId].lockedPeriod);
+        } else {
+            IERC20Mintable(baseToken).mint(msg.sender, amount);
+        }
+
+        emit IVOTokenClaimed(msg.sender, _saleId, amount);
+    }
+
+    function _refund(address _user, uint256 _amount) internal {
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool success, bytes memory res) = payable(_user).call{ value: _amount }("");
+        require(success, "Refund failed");
+    }
 }
